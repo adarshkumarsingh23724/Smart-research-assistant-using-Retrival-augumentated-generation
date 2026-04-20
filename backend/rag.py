@@ -1,7 +1,7 @@
 import os
 import tempfile
 from tempfile import NamedTemporaryFile
-from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -44,50 +44,85 @@ def get_vector_store():
 
 vector_store = None
 
+# Supported Groq models — sourced from https://console.groq.com/docs/models
+# Only active (non-deprecated) IDs are listed here.
+GROQ_MODELS = {
+    # Production models (stable, recommended for production use)
+    "llama-3.3-70b-versatile":               "Llama 3.3 70B (default)",
+    "llama-3.1-8b-instant":                  "Llama 3.1 8B (ultra fast)",
+    "openai/gpt-oss-120b":                   "GPT-OSS 120B (OpenAI)",
+    "openai/gpt-oss-20b":                    "GPT-OSS 20B (OpenAI)",
+    # Preview models (may be discontinued at short notice)
+    "meta-llama/llama-4-scout-17b-16e-instruct": "Llama 4 Scout 17B (preview)",
+    "qwen/qwen3-32b":                        "Qwen3 32B (preview)",
+}
+
+DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+
 def get_llm(model_override: str = None):
     """
-    Returns a DeepSeek R1 model running locally via Ollama.
-    Supports dynamic switching between fast (1.5b) and detailed (7b) models.
+    Returns a Groq-backed LLM.
+    Base model: llama-3.3-70b-versatile (set via GROQ_MODEL env var).
+    model_override accepts any key from GROQ_MODELS or any raw Groq model id.
+    DeepSeek models are served by Groq (deepseek-r1-distill-llama-70b etc.)
+    so no Ollama installation is required.
     """
-    # If the user explicitly selected a model via UI, use it. Otherwise fallback to env or 1.5b.
-    model = model_override if model_override else os.getenv("OLLAMA_MODEL", "deepseek-r1:1.5b")
-    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    return ChatOllama(
-        model=model,
-        base_url=base_url,
+    load_dotenv(override=True)
+    groq_api_key = os.getenv("GROQ_API_KEY")
+
+    if not groq_api_key or not groq_api_key.strip():
+        raise RuntimeError("[LLM] ❌ GROQ_API_KEY is not set in .env")
+
+    groq_model = model_override if model_override else os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
+
+    # Validate — warn but don't block for unknown model ids (Groq adds new models often)
+    if groq_model not in GROQ_MODELS:
+        print(f"[LLM] ⚠️  Unknown model id '{groq_model}' — sending to Groq anyway.")
+    else:
+        print(f"[LLM] Using Groq model: {groq_model} ({GROQ_MODELS[groq_model]})")
+
+    return ChatGroq(
+        api_key=groq_api_key,
+        model=groq_model,
         temperature=0,
     )
 
 def delete_file_chunks(file_name: str, course_id: str = None):
     """
     Deletes existing chunks for a specific file from the vector store to prevent duplication.
+    ChromaDB requires the $and operator when filtering on more than one field.
     """
     try:
         vs = get_vector_store()
-        
-        # Build where clause
-        where = {"source": file_name}
+
+        # ChromaDB only allows a single key at the top level of `where`.
+        # When we have multiple conditions we must use the $and operator.
         if course_id:
-            where["course_id"] = course_id
-            
-        # Get IDs matching the where clause
+            where = {"$and": [{"source": file_name}, {"course_id": course_id}]}
+        else:
+            where = {"source": file_name}
+
         results = vs.get(where=where)
         ids_to_delete = results.get("ids", [])
-        
+
         if ids_to_delete:
             vs.delete(ids_to_delete)
             print(f"Deleted {len(ids_to_delete)} existing chunks for {file_name}")
     except Exception as e:
         print(f"Error during deduplication: {e}")
 
-def _load_pptx(file_path: str) -> list:
+def _load_pptx(file_path: str, course_id: str = None, user_id: str = None) -> list:
     """
-    Extract text from a .pptx file using python-pptx (no LibreOffice needed).
-    Returns a list of LangChain Document objects, one per slide.
+    Extract text AND images from a .pptx file using python-pptx (no LibreOffice needed).
+    Returns a list of LangChain Document objects:
+      - One text Document per slide (existing behaviour)
+      - One image-caption Document per image/diagram (new — via Groq Vision)
     """
     from pptx import Presentation
     prs = Presentation(file_path)
-    docs = []
+    source_name = os.path.basename(file_path)
+    text_docs = []
+
     for slide_num, slide in enumerate(prs.slides, start=1):
         texts = []
         for shape in slide.shapes:
@@ -98,12 +133,30 @@ def _load_pptx(file_path: str) -> list:
                         texts.append(line)
         content = "\n".join(texts)
         if content.strip():
-            docs.append(Document(
+            text_docs.append(Document(
                 page_content=content,
-                metadata={"page": slide_num, "source": os.path.basename(file_path)}
+                metadata={"page": slide_num, "source": source_name}
             ))
-    print(f"[_load_pptx] Extracted {len(docs)} slide(s) from {os.path.basename(file_path)}")
-    return docs
+
+    print(f"[_load_pptx] Extracted {len(text_docs)} slide(s) of text from '{source_name}'")
+
+    # ── Vision: extract image captions from each slide ───────────────────────
+    image_docs = []
+    try:
+        from vision_extractor import process_pptx_images
+        image_docs = process_pptx_images(
+            pptx_path=file_path,
+            source_name=source_name,
+            course_id=course_id,
+            user_id=user_id,
+        )
+        if image_docs:
+            print(f"[_load_pptx] 🖼️  Vision added {len(image_docs)} image caption(s) from '{source_name}'")
+    except Exception as e:
+        print(f"[_load_pptx] ⚠️  Vision extraction failed (skipping): {e}")
+    # ─────────────────────────────────────────────────────────────────────────
+
+    return text_docs + image_docs
 
 
 def _load_ppt_via_com(file_path: str) -> list:
@@ -155,6 +208,7 @@ def _load_ppt_via_com(file_path: str) -> list:
 def ingest_file_from_path(file_path: str, course_id: str = None, user_id: str = None):
     """
     Ingests a file (.pdf, .docx, .pptx, .ppt) from a local file path with deduplication.
+    Now also extracts and AI-captions images/diagrams from PDFs and PPTX via the Vision LLM.
     """
     try:
         file_name = os.path.basename(file_path)
@@ -163,24 +217,75 @@ def ingest_file_from_path(file_path: str, course_id: str = None, user_id: str = 
         if ext == 'pdf':
             loader = PyPDFLoader(file_path)
             docs = loader.load()
+            # ── Vision: extract and caption images from each PDF page ────────
+            try:
+                from vision_extractor import process_pdf_images
+                image_docs = process_pdf_images(
+                    pdf_path=file_path,
+                    source_name=file_name,
+                    course_id=course_id,
+                    user_id=user_id,
+                )
+                if image_docs:
+                    print(f"[RAG] 🖼️  Vision added {len(image_docs)} image caption(s) from '{file_name}'")
+                    docs = docs + image_docs
+            except Exception as e:
+                print(f"[RAG] ⚠️  PDF vision extraction failed (skipping): {e}")
+            # ─────────────────────────────────────────────────────────────────
         elif ext == 'docx':
             loader = Docx2txtLoader(file_path)
             docs = loader.load()
+            # Fallback: Docx2txtLoader sometimes returns empty content for
+            # certain .docx files (e.g. text inside shapes/tables only).
+            # Try python-docx directly in that case.
+            if not docs or not any(d.page_content.strip() for d in docs):
+                print(f"[RAG] Docx2txtLoader returned no text for '{file_name}', trying python-docx fallback...")
+                try:
+                    from docx import Document as DocxDocument
+                    docx_doc = DocxDocument(file_path)
+                    full_text = "\n".join(
+                        para.text for para in docx_doc.paragraphs if para.text.strip()
+                    )
+                    if full_text.strip():
+                        from langchain_core.documents import Document
+                        docs = [Document(page_content=full_text, metadata={"source": file_name, "page": 1})]
+                    else:
+                        print(f"[RAG] python-docx also found zero text for '{file_name}'.")
+                except ImportError:
+                    print(f"[RAG] python-docx not installed, fallback skipped for '{file_name}'.")
         elif ext == 'pptx':
-            docs = _load_pptx(file_path)
+            # Pass course_id/user_id so vision_extractor can tag image docs correctly
+            docs = _load_pptx(file_path, course_id=course_id, user_id=user_id)
         elif ext == 'ppt':
-            # Convert legacy .ppt → .pptx via PowerPoint COM (Windows only, no LibreOffice needed)
             docs = _load_ppt_via_com(file_path)
         else:
             raise ValueError(f"Unsupported file extension: {ext}")
-        
+
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200,
             separators=["\n\n", "\n", ".", " ", ""]
         )
         splits = text_splitter.split_documents(docs)
-        
+
+        # Handle completely empty files (e.g. image-only docx files) instead of crashing
+        if not splits:
+            print(f"[RAG] Warning: '{file_name}' produced 0 text chunks. Inserting placeholder.")
+            from langchain_core.documents import Document
+            placeholder_text = f"The document '{file_name}' was uploaded but contained no extractable text. It may be an image-only scan or format not supported by the text extractor."
+            
+            # Create a single placeholder chunk
+            dummy_doc = Document(
+                page_content=placeholder_text,
+                metadata={
+                    "source": file_name,
+                    "page": 1,
+                    "course_id": course_id or "unknown",
+                    "user_id": user_id or "unknown"
+                }
+            )
+            splits = [dummy_doc]
+
         # Add metadata
         for split in splits:
             if course_id:
@@ -188,14 +293,14 @@ def ingest_file_from_path(file_path: str, course_id: str = None, user_id: str = 
             if user_id:
                 split.metadata["user_id"] = user_id
             split.metadata["source"] = file_name
-        
+
         # Deduplicate before adding
         delete_file_chunks(file_name, course_id)
-        
+
         # Add to vector store
         vs = get_vector_store()
         vs.add_documents(splits)
-        # Chroma saves automatically, no need to call save_local
+        print(f"[RAG] ✅ Ingested '{file_name}': {len(splits)} chunks added.")
         return {"status": "success", "chunks_added": len(splits)}
     except Exception as e:
         print(f"Error ingesting {file_path}: {e}")
@@ -271,7 +376,7 @@ def query_rag_stream(question: str, marks: int = 5, course_id: str = None, user_
     print(f"  Question : {question}")
     print(f"  Marks    : {marks}")
     print(f"  Course ID: {course_id}")
-    print(f"  Model    : {model or 'default (deepseek-r1:1.5b)'}")
+    print(f"  Model    : {model or f'default ({DEFAULT_GROQ_MODEL})'}")
     print(SEP)
 
     print(f"[RAG] ⚙️  Initializing LLM ({model or 'default'})...")
@@ -320,22 +425,22 @@ def query_rag_stream(question: str, marks: int = 5, course_id: str = None, user_
     print("-" * 70)
     # ────────────────────────────────────────────────────────────────────────
 
-    # Define length instruction and formatting
+    # ── Build marks-specific instructions ───────────────────────────────────
     format_instruction = ""
     marks_val = str(marks).strip()
-    
+    marks_int = int(marks_val) if marks_val in ["1", "2", "5", "10"] else 0
+
     if marks_val in ["2", "5", "10", 2, 5, 10]:
         marks_int = int(marks_val)
         if marks_int == 2:
-            length_instruction = "Answer in 7 to 10 lines. Detail the points clearly."
+            length_instruction = "Answer in EXACTLY 40 to 50 words. Plain text only — no code blocks, no diagrams."
             format_instruction = """
-Use this exact exam format. Each section MUST be on its own NEW LINE:
-**Definition:** 2 lines of definition
-**Key Points:** 3-4 lines with bullet points
-**Example/Application:** 1-2 lines with an example
-**Conclusion:** 1 line
+Write a clean 40-50 word text answer. Use this format:
+**Definition:** One clear definition sentence.
+**Key Points:** 2-3 brief bullet points.
+**Application:** Brief example if needed.
 
-IMPORTANT: Put each section on a separate line. Do NOT run them together."""
+STRICT RULE for 2 marks: Do NOT include any code blocks, image descriptions, or lengthy explanations."""
         elif marks_int == 5:
             length_instruction = "Answer in 20 to 25 lines. Cover the topic comprehensively."
             format_instruction = """
@@ -345,12 +450,13 @@ Use this exact exam format. Each section MUST start on a NEW LINE:
 **Types/Categories:**
 - Type 1: description
 - Type 2: description
-- Type 3: description
 **Working/Explanation:** 5-6 lines explaining how it works
-**Advantages/Significance:**
-- Point 1
-- Point 2
 **Conclusion:** 1-2 lines
+
+VISUAL & CODE SUPPLEMENT (for 5-mark answers):
+- If the Context contains any actual code, reproduce it EXACTLY under a heading **Code Example:** in a fenced code block. If the Context discusses a coding topic without a snippet, write a short illustrative code block yourself.
+- If the Context contains an IMAGE DESCRIPTION (diagrams, flowcharts, graphs) relevant to this topic, you MUST extract and describe it clearly under a heading **Diagram/Visual:**.
+- These sections are ADDITIONAL to the main text.
 
 IMPORTANT: Every heading and bullet MUST be on its own line. Do NOT merge sections."""
         elif marks_int == 10:
@@ -362,17 +468,16 @@ Use this exact exam format. Every section and bullet MUST be on its own NEW LINE
 **Types/Classification:**
 1. Type 1: detailed description
 2. Type 2: detailed description
-3. Type 3: detailed description
 **Detailed Explanation/Working:** 10-12 lines of in-depth explanation
-**Advantages:**
+**Advantages & Limitations:**
 - Advantage 1 (detailed)
-- Advantage 2 (detailed)
-- Advantage 3 (detailed)
-**Disadvantages/Limitations:**
 - Limitation 1 (detailed)
-- Limitation 2 (detailed)
-**Applications/Examples:** 4-5 lines with real-world use cases
 **Conclusion:** 2-3 concluding lines
+
+VISUAL & CODE SUPPLEMENT (mandatory for 10-mark answers if relevant):
+- If the Context contains actual code, pseudocode, or algorithms → reproduce it EXACTLY in a fenced code block under **Code Example:**. If the Context discusses a coding topic without a snippet, write a comprehensive, well-commented code block yourself.
+- If the Context contains an IMAGE DESCRIPTION (diagrams, flowcharts, architecture) relevant to the topic → you MUST extract and describe its flow, relationships, and components in detail under a **Diagram/Visual:** heading.
+- These sections are MANDATORY for 10-mark answers if the topic allows!
 
 IMPORTANT: Every heading, numbered point, and bullet MUST be on its own line. Do NOT merge sections."""
     elif marks_val == "1" or marks_val == 1:
@@ -380,33 +485,44 @@ IMPORTANT: Every heading, numbered point, and bullet MUST be on its own line. Do
     else:
         length_instruction = "Answer in a moderate paragraph."
 
-    template = f"""You are a strict academic teaching assistant.
-    Answer the question based ONLY on the following context.
-    Under NO CIRCUMSTANCES should you use outside knowledge to answer the question.
-    If the provided context does not contain the answer, you MUST reply exactly with: 
-    "I cannot answer this based on the provided materials."
-    
-    When answering, you MUST cite the source of your information at the end of your response using the filename(s) found in the context metadata. Example: "Source: lecture1.pdf"
+    # Warn early if no context was retrieved
+    if not _raw_docs:
+        print("[RAG] ⚠️  No context retrieved — LLM will be told to refuse the answer.")
 
-    Context:
-    {{context}}
-    
-    Question: {{question}}
-    
-    Instruction: {length_instruction}
-    {format_instruction}
-    """
+    template = f"""You are an expert academic exam assistant helping students study. Answer questions using the provided study materials below.
+
+CRITICAL RULES:
+1. Base your factual text answer on the content from the Context section below.
+2. Do NOT fabricate historical facts, names, dates, or textual definitions that are NOT in the Context.
+3. If the Context does not mention the topic at all, respond ONLY with: "I cannot answer this based on the provided materials."
+4. At the end of every answer you MUST cite source file(s). Example: "Source: lecture1.pdf, Page 5"
+5. If writing code examples for 5/10 marks, you may use external knowledge to write syntactically correct code that illustrates the concepts discussed in the Context.
+
+Context (primary source of truth):
+{{context}}
+
+Question: {{question}}
+
+Marks: {marks_int} marks
+Instruction: {length_instruction}
+{format_instruction}"""
     
     prompt = ChatPromptTemplate.from_template(template)
     
     def format_docs(docs):
-        # Flatten the documents into a string but inject source metadata for the LLM
+        """Format retrieved docs into a clearly labelled context string for the LLM."""
+        if not docs:
+            return "[No relevant context found in the uploaded materials.]"
         lines = []
         for doc in docs:
             source = doc.metadata.get("source", "Unknown Document")
-            page = doc.metadata.get("page", "Unknown Page")
-            lines.append(f"[Source: {{source}}, Page: {{page}}]\n{{doc.page_content}}\n---\n")
-        return "".join(lines)
+            page   = doc.metadata.get("page",   "?")
+            lines.append(
+                f"--- BEGIN EXCERPT [File: {source}, Page: {page}] ---\n"
+                f"{doc.page_content.strip()}\n"
+                f"--- END EXCERPT ---\n"
+            )
+        return "\n".join(lines)
     
     chain = (
         {"context": retriever | format_docs, "question": RunnablePassthrough()}
@@ -419,10 +535,217 @@ IMPORTANT: Every heading, numbered point, and bullet MUST be on its own line. Do
     print(f"[RAG] 🤖 LLM STREAMING — tokens below:")
     print("-" * 70)
     token_count = 0
-    for chunk in chain.stream(question):
-        print(chunk, end="", flush=True)   # live token output
-        token_count += 1
-        yield chunk
+
+    def _stream_chain(active_chain):
+        """Inner generator to stream from the given chain."""
+        for chunk in active_chain.stream(question):
+            print(chunk, end="", flush=True)
+            yield chunk
+
+        filename = file_upload.filename
+        if '.' in filename:
+            ext = '.' + filename.split('.')[-1]
+
+    # Save uploaded file temporarily
+    with NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        try:
+            tmp.write(file_upload.file.read())
+            tmp_path = tmp.name
+            return ingest_file_from_path(tmp_path, user_id=user_id)
+        finally:
+            try:
+                # Ensure the file is closed before trying to remove it
+                pass
+                os.unlink(tmp_path)
+            except PermissionError:
+                # On Windows, sometimes file is still locked.
+                print(f"Warning: Could not delete temp file {tmp_path}")
+
+def query_rag_stream(question: str, marks: int = 5, course_id: str = None, user_id: str = None, model: str = None):
+    """
+    Queries the RAG system and yields tokens as they are generated by the LLM.
+    """
+    SEP = "=" * 70
+    print(f"\n{SEP}")
+    print(f"[RAG] 🔍 QUERY RECEIVED")
+    print(f"  Question : {question}")
+    print(f"  Marks    : {marks}")
+    print(f"  Course ID: {course_id}")
+    print(f"  Model    : {model or f'default ({DEFAULT_GROQ_MODEL})'}")
+    print(SEP)
+
+    print(f"[RAG] ⚙️  Initializing LLM ({model or 'default'})...")
+    llm = get_llm(model_override=model)
+    print(f"[RAG] ✅ LLM ready. Now retrieving documents from ChromaDB...")
+    
+    # Configure MMR (Maximal Marginal Relevance) for better diversity and relevance
+    search_kwargs = {"k": 10, "fetch_k": 30}
+    
+    # Construct filter for ChromaDB
+    filters = {}
+    if course_id:
+        filters["course_id"] = course_id
+    if user_id:
+        filters["user_id"] = user_id
+        
+    if filters:
+        if len(filters) > 1:
+            # Chroma handles $and naturally or can just pass the dict directly
+            search_kwargs["filter"] = {"$and": [{k: v} for k, v in filters.items()]}
+        else:
+            search_kwargs["filter"] = filters
+        
+    retriever = get_vector_store().as_retriever(
+        search_type="mmr",
+        search_kwargs=search_kwargs
+    )
+
+    # ── DEBUG: show retrieved chunks before building the prompt ──────────────
+    _raw_docs = retriever.invoke(question)
+    print(f"\n[RAG] 📄 RETRIEVED {len(_raw_docs)} CHUNK(S) from ChromaDB")
+    print("-" * 70)
+    for i, doc in enumerate(_raw_docs, start=1):
+        src  = doc.metadata.get("source", "unknown")
+        page = doc.metadata.get("page", "?")
+        cid  = doc.metadata.get("course_id", "—")
+        snippet = doc.page_content.replace("\n", " ").strip()[:200]
+        print(f"  Chunk {i}/{len(_raw_docs)}")
+        print(f"    Source    : {src}")
+        print(f"    Page      : {page}")
+        print(f"    Course ID : {cid}")
+        print(f"    Snippet   : {snippet}...")
+        print()
+    if not _raw_docs:
+        print("  ⚠️  No chunks found — LLM will respond with 'cannot answer'.")
+    print("-" * 70)
+    # ────────────────────────────────────────────────────────────────────────
+
+    # ── Build marks-specific instructions ───────────────────────────────────
+    format_instruction = ""
+    marks_val = str(marks).strip()
+    marks_int = int(marks_val) if marks_val in ["1", "2", "5", "10"] else 0
+
+    if marks_val in ["2", "5", "10", 2, 5, 10]:
+        marks_int = int(marks_val)
+        if marks_int == 2:
+            length_instruction = "Answer in EXACTLY 40 to 50 words. Plain text only — no code blocks, no diagrams."
+            format_instruction = """
+Write a clean 40-50 word text answer. Use this format:
+**Definition:** One clear definition sentence.
+**Key Points:** 2-3 brief bullet points.
+**Application:** Brief example if needed.
+
+STRICT RULE for 2 marks: Do NOT include any code blocks, image descriptions, or lengthy explanations."""
+        elif marks_int == 5:
+            length_instruction = "Answer in 20 to 25 lines. Cover the topic comprehensively."
+            format_instruction = """
+Use this exact exam format. Each section MUST start on a NEW LINE:
+**Topic:** name of topic
+**Definition:** 3-4 line definition
+**Types/Categories:**
+- Type 1: description
+- Type 2: description
+**Working/Explanation:** 5-6 lines explaining how it works
+**Conclusion:** 1-2 lines
+
+VISUAL & CODE SUPPLEMENT (for 5-mark answers):
+- If the Context contains any actual code, reproduce it EXACTLY under a heading **Code Example:** in a fenced code block. If the Context discusses a coding topic without a snippet, write a short illustrative code block yourself.
+- If the Context contains an IMAGE DESCRIPTION (diagrams, flowcharts, graphs) relevant to this topic, you MUST extract and describe it clearly under a heading **Diagram/Visual:**.
+- These sections are ADDITIONAL to the main text.
+
+IMPORTANT: Every heading and bullet MUST be on its own line. Do NOT merge sections."""
+        elif marks_int == 10:
+            length_instruction = "Answer in 40 to 45 lines. Provide an extremely detailed and comprehensive explanation."
+            format_instruction = """
+Use this exact exam format. Every section and bullet MUST be on its own NEW LINE:
+**Topic:** name of topic
+**Introduction & Definition:** 4-5 line detailed definition and background
+**Types/Classification:**
+1. Type 1: detailed description
+2. Type 2: detailed description
+**Detailed Explanation/Working:** 10-12 lines of in-depth explanation
+**Advantages & Limitations:**
+- Advantage 1 (detailed)
+- Limitation 1 (detailed)
+**Conclusion:** 2-3 concluding lines
+
+VISUAL & CODE SUPPLEMENT (mandatory for 10-mark answers if relevant):
+- If the Context contains actual code, pseudocode, or algorithms → reproduce it EXACTLY in a fenced code block under **Code Example:**. If the Context discusses a coding topic without a snippet, write a comprehensive, well-commented code block yourself.
+- If the Context contains an IMAGE DESCRIPTION (diagrams, flowcharts, architecture) relevant to the topic → you MUST extract and describe its flow, relationships, and components in detail under a **Diagram/Visual:** heading.
+- These sections are MANDATORY for 10-mark answers if the topic allows!
+
+IMPORTANT: Every heading, numbered point, and bullet MUST be on its own line. Do NOT merge sections."""
+    elif marks_val == "1" or marks_val == 1:
+        length_instruction = "Answer in EXACTLY 2 lines. One definition line and one example/use-case line."
+    else:
+        length_instruction = "Answer in a moderate paragraph."
+
+    # Warn early if no context was retrieved
+    if not _raw_docs:
+        print("[RAG] ⚠️  No context retrieved — LLM will be told to refuse the answer.")
+
+    template = f"""You are an expert academic exam assistant helping students study. Answer questions using the provided study materials below.
+
+CRITICAL RULES:
+1. Base your factual text answer on the content from the Context section below.
+2. Do NOT fabricate historical facts, names, dates, or textual definitions that are NOT in the Context.
+3. If the Context does not mention the topic at all, respond ONLY with: "I cannot answer this based on the provided materials."
+4. At the end of every answer you MUST cite source file(s). Example: "Source: lecture1.pdf, Page 5"
+5. If writing code examples for 5/10 marks, you may use external knowledge to write syntactically correct code that illustrates the concepts discussed in the Context.
+
+Context (primary source of truth):
+{{context}}
+
+Question: {{question}}
+
+Marks: {marks_int} marks
+Instruction: {length_instruction}
+{format_instruction}"""
+    
+    prompt = ChatPromptTemplate.from_template(template)
+    
+    def format_docs(docs):
+        """Format retrieved docs into a clearly labelled context string for the LLM."""
+        if not docs:
+            return "[No relevant context found in the uploaded materials.]"
+        lines = []
+        for doc in docs:
+            source = doc.metadata.get("source", "Unknown Document")
+            page   = doc.metadata.get("page",   "?")
+            lines.append(
+                f"--- BEGIN EXCERPT [File: {source}, Page: {page}] ---\n"
+                f"{doc.page_content.strip()}\n"
+                f"--- END EXCERPT ---\n"
+            )
+        return "\n".join(lines)
+    
+    chain = (
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    # ── DEBUG: stream tokens and print each one to terminal ─────────────────
+    print(f"[RAG] 🤖 LLM STREAMING — tokens below:")
+    print("-" * 70)
+    token_count = 0
+
+    def _stream_chain(active_chain):
+        """Inner generator to stream from the given chain."""
+        for chunk in active_chain.stream(question):
+            print(chunk, end="", flush=True)
+            yield chunk
+
+    try:
+        for chunk in _stream_chain(chain):
+            token_count += 1
+            yield chunk
+    except Exception as stream_err:
+        print(f"\n[RAG] ❌ GROQ ERROR: {stream_err}")
+        print(f"[RAG] ❌ Error type: {type(stream_err).__name__}")
+        raise
+
     print(f"\n{'-' * 70}")
     print(f"[RAG] ✅ Stream complete. Total token chunks emitted: {token_count}")
     print("=" * 70 + "\n")
@@ -458,3 +781,107 @@ def delete_course_data(course_id: str):
     except Exception as e:
         print(f"Error deleting course data: {e}")
         return False
+
+def generate_assessment(topic: str, course_id: str, assessment_type: str, count: int = 5, model: str = None, file_name: str = None) -> str:
+    """
+    Generates an assessment (quiz or flashcards) in strict JSON format based on course material.
+    """
+    llm = get_llm(model)
+    
+    # Force JSON mode for models that support it
+    # Note: Groq supports response_format={"type": "json_object"}
+    try:
+        llm = llm.bind(response_format={"type": "json_object"})
+    except Exception:
+        pass # fallback if model binding fails
+
+    # Retrieve context with MMR (Maximal Marginal Relevance) 
+    # to ensure diversity, pulling chunks from across the entire document
+    search_kwargs = {"k": 20, "fetch_k": 100}
+    
+    # Build filter conditions
+    if course_id and file_name:
+        if file_name == "ALL":
+            search_kwargs["filter"] = {"course_id": course_id}
+        else:
+            search_kwargs["filter"] = {"$and": [{"course_id": course_id}, {"source": file_name}]}
+    elif course_id:
+        search_kwargs["filter"] = {"course_id": course_id}
+    elif file_name and file_name != "ALL":
+        search_kwargs["filter"] = {"source": file_name}
+        
+    retriever = get_vector_store().as_retriever(
+        search_type="mmr",
+        search_kwargs=search_kwargs
+    )
+    
+    docs = retriever.invoke(topic)
+    
+    if not docs:
+        if assessment_type == "quiz":
+            return '{"questions": []}'
+        else:
+            return '{"flashcards": []}'
+            
+    context_text = "\n".join([d.page_content for d in docs])
+
+    if assessment_type == "quiz":
+        instruction = f"""Generate a {count}-question multiple-choice quiz about "{topic}" based strictly on the provided Context.
+You MUST output valid, parseable JSON exactly matching this schema:
+{{
+  "questions": [
+    {{
+      "question": "The question text?",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correctIndex": 0,
+      "explanation": "A short explanation of why this is correct based on the context."
+    }}
+  ]
+}}
+Ensure "correctIndex" is an integer between 0 and 3."""
+    elif assessment_type == "flashcard":
+        instruction = f"""Generate {count} flashcards about "{topic}" based strictly on the provided Context.
+You MUST output valid, parseable JSON exactly matching this schema:
+{{
+  "flashcards": [
+    {{
+      "front": "A clear question or concept name?",
+      "back": "A concise, accurate definition or explanation."
+    }}
+  ]
+}}"""
+    else:
+        return "{}"
+
+    template = f"""You are an educational AI. Your ONLY output must be a valid JSON object.
+Do NOT wrap the JSON in markdown blocks like ```json ... ```. Output raw JSON only.
+
+Context from Course Materials:
+{context_text}
+
+{instruction}
+"""
+    try:
+        from langchain_core.messages import SystemMessage, HumanMessage
+        messages = [
+            SystemMessage(content="You are a JSON-only API. You must return valid JSON without any markdown formatting, preamble, or postscript."),
+            HumanMessage(content=template)
+        ]
+        response = llm.invoke(messages)
+        content = response.content.strip()
+        
+        # Cleanup in case the LLM ignored instructions and returned markdown blocks
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+            
+        return content.strip()
+    except Exception as e:
+        print(f"Error generating assessment: {e}")
+        if assessment_type == "quiz":
+            return '{"questions": []}'
+        else:
+            return '{"flashcards": []}'

@@ -7,6 +7,7 @@ import Stream from './components/Stream';
 import MaterialDetails from './pages/MaterialDetails';
 import WorkspaceLayout from './components/WorkspaceLayout';
 import UploadMaterial from './components/UploadMaterial';
+import Assessments from './pages/Assessments';
 import LoginPage from './pages/LoginPage';
 import { getAuthStatus } from './api';
 import { Loader2 } from 'lucide-react';
@@ -75,6 +76,9 @@ function App() {
 
             {/* Upload Material view */}
             <Route path="upload" element={<UploadMaterial />} />
+            
+            {/* Assessments view */}
+            <Route path="assessments" element={<Assessments />} />
             
             {/* Material Details view */}
             <Route path="material/:fileName" element={<MaterialDetails />} />

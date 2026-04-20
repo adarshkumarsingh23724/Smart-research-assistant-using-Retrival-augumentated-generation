@@ -8,6 +8,14 @@ import asyncio
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+# Patch socket.getaddrinfo to fix WinError 10060 timeouts caused by IPv6 blackholing
+import socket
+original_getaddrinfo = socket.getaddrinfo
+def getaddrinfo_ipv4_only(*args, **kwargs):
+    responses = original_getaddrinfo(*args, **kwargs)
+    return [res for res in responses if res[0] == socket.AF_INET]
+socket.getaddrinfo = getaddrinfo_ipv4_only
+
 import google_classroom as gc
 from dotenv import load_dotenv
 
@@ -234,21 +242,29 @@ def ingest_specific_file(course_id: str, file_name: str):
         raise HTTPException(status_code=404, detail=f"File '{file_name}' not found in course.")
         
     print(f"[Ingest] Found file '{file_name}' with ID '{file_id}'. Starting ingest...")
-    success = embed_specific_file(course_id, file_id, file_name, email=email)
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to download and ingest file.")
+    try:
+        embed_specific_file(course_id, file_id, file_name, email=email)
+    except ValueError as ve:
+        # Expected errors, like empty text or unsupported format
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        # Unexpected errors (API failure, etc)
+        raise HTTPException(status_code=500, detail=f"Failed to ingest file: {str(e)}")
         
     return {"status": "success", "message": f"Successfully ingested {file_name}"}
 
 import shutil
 
 def background_upload_ingest(course_id: str, file_bytes: bytes, file_name: str, email: str = None):
-    """Background task: ingest an uploaded file from memory into ChromaDB."""
+    """Background task: ingest an uploaded file from memory into ChromaDB (text + vision)."""
     try:
         from rag import ingest_file_from_bytes
-        print(f"[Upload] Ingesting '{file_name}' for course {course_id}...")
-        ingest_file_from_bytes(file_bytes, file_name, course_id=course_id, user_id=email)
-        print(f"[Upload] Successfully ingested '{file_name}'.")
+        enable_vision = os.getenv("ENABLE_VISION", "true").lower() == "true"
+        vision_note = " + 🖼️ vision image analysis" if enable_vision else ""
+        print(f"[Upload] Ingesting '{file_name}' for course {course_id}{vision_note}...")
+        result = ingest_file_from_bytes(file_bytes, file_name, course_id=course_id, user_id=email)
+        total = result.get("chunks_added", 0) if isinstance(result, dict) else 0
+        print(f"[Upload] ✅ Successfully ingested '{file_name}' — {total} total chunks.")
     except Exception as e:
         print(f"[Upload] Failed to ingest '{file_name}': {e}")
 
@@ -370,6 +386,31 @@ async def ask_question(request: QueryRequest):
         from rag import query_rag
         answer = query_rag(request.question, request.marks, request.course_id)
         return {"answer": answer}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class AssessmentRequest(BaseModel):
+    topic: str
+    type: str = "quiz" # "quiz" or "flashcard"
+    count: Optional[int] = 5
+    model: Optional[str] = None
+    fileName: Optional[str] = None
+
+@app.post("/api/courses/{course_id}/assessment")
+async def generate_course_assessment(course_id: str, request: AssessmentRequest):
+    try:
+        from rag import generate_assessment
+        result_json = generate_assessment(
+            topic=request.topic,
+            course_id=course_id,
+            assessment_type=request.type,
+            count=request.count,
+            model=request.model,
+            file_name=request.fileName
+        )
+        return json.loads(result_json)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Failed to parse LLM output as JSON.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

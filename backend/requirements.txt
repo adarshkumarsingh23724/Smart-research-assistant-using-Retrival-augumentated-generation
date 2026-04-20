@@ -23,3 +23,5 @@ unstructured
 networkx
 tf-keras
 comtypes
+Pillow
+pymupdf

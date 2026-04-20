@@ -160,6 +160,15 @@ const ClassDetails = () => {
                                 AI Chat
                             </NavLink>
                             <NavLink
+                                to={`/course/${course.id}/assessments`}
+                                className={({ isActive }) => `
+                                    px-5 py-2 rounded-xl text-[11px] font-bold tracking-wide transition-all
+                                    ${isActive ? 'bg-orange-600/10 dark:bg-orange-600/20 text-orange-600 dark:text-orange-400 shadow-sm' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}
+                                `}
+                            >
+                                Assessments
+                            </NavLink>
+                            <NavLink
                                 to={`/course/${course.id}/upload`}
                                 className={({ isActive }) => `
                                     px-5 py-2 rounded-xl text-[11px] font-bold tracking-wide transition-all

@@ -1,8 +1,9 @@
 import React, { useState, useCallback } from 'react';
 import { useOutletContext } from 'react-router-dom';
-import { UploadCloud, File as FileIcon, X, CheckCircle2, AlertCircle, Loader2, Bot } from 'lucide-react';
+import { UploadCloud, File as FileIcon, X, CheckCircle2, AlertCircle, Loader2, Bot, Eye, Image as ImageIcon } from 'lucide-react';
 import { uploadCourseFile } from '../api';
 import ChatInterface from './ChatInterface';
+
 
 const UploadMaterial = () => {
     const { course } = useOutletContext();
@@ -118,6 +119,19 @@ const UploadMaterial = () => {
                                 <li>Store in ChromaDB for sub-millisecond retrieval</li>
                                 <li>Ground AI answers in these specific materials</li>
                             </ul>
+
+                            {/* Vision AI feature callout */}
+                            <div className="mt-4 p-3 rounded-xl bg-indigo-500/10 border border-indigo-500/20 flex gap-3 items-start">
+                                <Eye size={18} className="text-indigo-400 shrink-0 mt-0.5" />
+                                <div>
+                                    <p className="text-[12px] font-black text-indigo-400 uppercase tracking-widest mb-1">🖼️ Multimodal Vision AI</p>
+                                    <p className="text-[11px] text-[var(--text-muted)] font-bold leading-relaxed">
+                                        Images, graphs, diagrams & charts inside your slides are automatically
+                                        analyzed by a Vision LLM and stored as searchable captions.
+                                    </p>
+                                </div>
+                            </div>
+
                             <p className="text-[11px] text-[var(--text-muted)] italic mt-4 border-t border-[var(--border-subtle)] pt-4">
                                 Supports: .pdf, .docx, .pptx, .txt
                             </p>
@@ -176,16 +190,31 @@ const UploadMaterial = () => {
                                         <div className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 
                                             ${item.status === 'success' ? 'bg-emerald-600/10 dark:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400' : 
                                               item.status === 'error' ? 'bg-rose-600/10 dark:bg-rose-500/20 text-rose-600 dark:text-rose-400' : 
-                                              'bg-[var(--border-subtle)] text-[var(--text-muted)]'}`}>
+                                              item.status === 'uploading' ? 'bg-indigo-500/15 text-indigo-400' :
+                                              'bg-[var(--border-subtle)] text-[var(--text-muted)]'}}`}>
                                             {item.status === 'uploading' ? <Loader2 size={18} className="animate-spin" /> : <FileIcon size={18} />}
                                         </div>
                                         <div className="flex-1 min-w-0">
                                             <p className="text-sm font-bold text-[var(--text-main)] truncate leading-none mb-1">
                                                 {item.file.name}
                                             </p>
-                                            <p className="text-[10px] font-bold text-[var(--text-muted)] leading-none uppercase tracking-tight">
-                                                {(item.file.size / 1024 / 1024).toFixed(2)} MB • {item.status.toUpperCase()}
-                                            </p>
+                                            <div className="flex items-center gap-2">
+                                                <p className="text-[10px] font-bold text-[var(--text-muted)] leading-none uppercase tracking-tight">
+                                                    {(item.file.size / 1024 / 1024).toFixed(2)} MB • {item.status.toUpperCase()}
+                                                </p>
+                                                {/* Vision analysis badge during upload */}
+                                                {item.status === 'uploading' && (
+                                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-indigo-500/15 border border-indigo-500/25 text-[9px] font-black text-indigo-400 uppercase tracking-widest animate-pulse">
+                                                        <Eye size={9} /> Vision AI
+                                                    </span>
+                                                )}
+                                                {/* Success message */}
+                                                {item.status === 'success' && item.message && (
+                                                    <p className="text-[10px] font-bold text-emerald-400 leading-none truncate max-w-[200px]">
+                                                        {item.message}
+                                                    </p>
+                                                )}
+                                            </div>
                                         </div>
                                         {item.status === 'pending' || item.status === 'error' ? (
                                             <button 
@@ -207,9 +236,9 @@ const UploadMaterial = () => {
                                     className="w-full py-2.5 rounded-xl bg-indigo-600 text-white text-sm font-black uppercase tracking-widest shadow-2xl hover:bg-indigo-700 transition-all flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer active:scale-95"
                                 >
                                     {isProcessing ? (
-                                        <><Loader2 size={16} className="animate-spin" /> Processing Queue...</>
+                                        <><Loader2 size={16} className="animate-spin" /> Processing + Vision Analysis...</>
                                     ) : (
-                                        <><UploadCloud size={18} /> Process & Ingest Into Vector DB</>
+                                        <><UploadCloud size={18} /> Process, Analyze Images &amp; Ingest</>
                                     )}
                                 </button>
                             </div>

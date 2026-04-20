@@ -4,8 +4,7 @@ import {
     Cpu,
     Compass,
     Shield,
-    ChevronRight,
-    BookOpen
+    ChevronRight
 } from 'lucide-react';
 import { fetchCourses } from '../api';
 
@@ -42,12 +41,16 @@ const Sidebar = () => {
             {/* Logo area - Clean and School-centric */}
             <div className="p-6 border-b border-[var(--border-subtle)] flex items-center justify-between">
                 <Link to="/" className="flex items-center gap-3 transition-transform active:scale-95">
-                    <div className="w-10 h-10 rounded-full bg-indigo-600 flex items-center justify-center text-white shadow-md shadow-indigo-100 group-hover:rotate-12 transition-all duration-300">
-                        <BookOpen size={22} strokeWidth={2} />
+                    <div className="w-11 h-11 rounded-full bg-white flex items-center justify-center shadow-lg shadow-green-800/40 shrink-0 overflow-hidden">
+                        <img
+                            src="/logo-icon.png"
+                            alt="Smart Research Assistant"
+                            className="w-full h-full object-cover"
+                        />
                     </div>
                     <div>
-                        <span className="text-lg font-bold text-[var(--text-main)] tracking-tight block leading-none">AI Tutor</span>
-                        <span className="text-[10px] font-bold text-indigo-500 uppercase tracking-widest leading-none mt-1 block">Contextual RAG</span>
+                        <span className="text-lg font-bold text-[var(--text-main)] tracking-tight block leading-none">Smart Research</span>
+                        <span className="text-[10px] font-bold text-green-600 uppercase tracking-widest leading-none mt-1 block">Assistant</span>
                     </div>
                 </Link>
             </div>

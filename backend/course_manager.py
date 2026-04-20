@@ -212,18 +212,18 @@ def embed_specific_file(course_id: str, file_id: str, file_name: str, email: str
     Downloads a single Drive file into memory and ingests it into ChromaDB.
     """
     import google_classroom as gc
-    try:
-        creds, _ = gc.authenticate(email)
-        drive_service = gc.get_drive_service(creds)
-        file_bytes, _ = gc.download_file_to_memory(drive_service, file_id, file_name)
-        if not file_bytes:
-            raise Exception(f"Download returned no bytes for {file_name}")
-        rag.ingest_file_from_bytes(file_bytes, file_name, course_id=course_id, user_id=email)
-        print(f"[CourseManager] Successfully ingested: {file_name}")
-        return True
-    except Exception as e:
-        print(f"[CourseManager] embed_specific_file error: {e}")
-        return False
+    
+    creds, _ = gc.authenticate(email)
+    drive_service = gc.get_drive_service(creds)
+    file_bytes, _ = gc.download_file_to_memory(drive_service, file_id, file_name)
+    
+    if not file_bytes:
+        raise ValueError(f"Download returned no bytes for {file_name}")
+        
+    # rag.ingest_file_from_bytes will raise ValueError if there is no extractable text
+    rag.ingest_file_from_bytes(file_bytes, file_name, course_id=course_id, user_id=email)
+    print(f"[CourseManager] Successfully ingested: {file_name}")
+    return True
 
 
 # ---------------------------------------------------------------------------

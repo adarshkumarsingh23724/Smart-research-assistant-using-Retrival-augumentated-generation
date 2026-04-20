@@ -58,6 +58,16 @@ export const ingestFile = async (courseId, fileName) => {
     }
 };
 
+export const generateAssessment = async (courseId, payload) => {
+    try {
+        const response = await axios.post(`${API_BASE_URL}/api/courses/${courseId}/assessment`, payload);
+        return response.data;
+    } catch (error) {
+        console.error("Error generating assessment:", error);
+        throw error;
+    }
+};
+
 export const uploadCourseFile = async (courseId, file) => {
     try {
         const formData = new FormData();
